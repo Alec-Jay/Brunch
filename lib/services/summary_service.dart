@@ -14,7 +14,10 @@ class SummaryResult {
 }
 
 class SummaryService {
-  static const _openAiUrl =
+  // Groq uses the same format as OpenAI
+  static const _groqChatUrl =
+      'https://api.groq.com/openai/v1/chat/completions';
+  static const _openAiChatUrl =
       'https://api.openai.com/v1/chat/completions';
   static const _claudeUrl =
       'https://api.anthropic.com/v1/messages';
@@ -37,47 +40,37 @@ Use exactly this structure:
 }
 
 Guidelines:
-- Summary: be concise and professional, mention who was involved if clear
-- Action items: be specific, include owner and deadline if mentioned
-- Key decisions: list concrete decisions made (empty array if none)
-- If speech is unclear or incomplete, do your best with available context
+- Summary: concise and professional, mention participants if clear
+- Action items: specific, include owner and deadline if mentioned (empty array if none)
+- Key decisions: concrete decisions made (empty array if none)
+- If speech is unclear, do your best with available context
 ''';
 
-  /// Generates a summary using OpenAI GPT-4o.
-  Future<SummaryResult> summarizeWithOpenAI(
+  /// Summarize with Groq (free — Llama 3.3 70B).
+  Future<SummaryResult> summarizeWithGroq(
       String transcript, String apiKey) async {
-    final response = await http
-        .post(
-          Uri.parse(_openAiUrl),
-          headers: {
-            'Authorization': 'Bearer $apiKey',
-            'Content-Type': 'application/json',
-          },
-          body: jsonEncode({
-            'model': 'gpt-4o',
-            'messages': [
-              {'role': 'system', 'content': _systemPrompt},
-              {
-                'role': 'user',
-                'content':
-                    'Please summarize this meeting transcript:\n\n$transcript'
-              },
-            ],
-            'temperature': 0.3,
-            'max_tokens': 1000,
-          }),
-        )
-        .timeout(const Duration(minutes: 2),
-            onTimeout: () =>
-                throw SummaryException('Request timed out.'));
-
-    if (response.statusCode == 200) {
-      return _parseOpenAiResponse(response.body);
-    }
-    _throwOpenAiError(response.statusCode, response.body);
+    return _summarizeOpenAiCompat(
+      transcript: transcript,
+      apiKey: apiKey,
+      url: _groqChatUrl,
+      model: 'llama-3.3-70b-versatile',
+      providerName: 'Groq',
+    );
   }
 
-  /// Generates a summary using Anthropic Claude.
+  /// Summarize with OpenAI GPT-4o.
+  Future<SummaryResult> summarizeWithOpenAI(
+      String transcript, String apiKey) async {
+    return _summarizeOpenAiCompat(
+      transcript: transcript,
+      apiKey: apiKey,
+      url: _openAiChatUrl,
+      model: 'gpt-4o',
+      providerName: 'OpenAI',
+    );
+  }
+
+  /// Summarize with Anthropic Claude.
   Future<SummaryResult> summarizeWithClaude(
       String transcript, String apiKey) async {
     final response = await http
@@ -106,35 +99,77 @@ Guidelines:
                 throw SummaryException('Request timed out.'));
 
     if (response.statusCode == 200) {
-      return _parseClaudeResponse(response.body);
+      try {
+        final json = jsonDecode(response.body) as Map<String, dynamic>;
+        final content =
+            (json['content'] as List).first['text'] as String;
+        return _parseJson(content);
+      } catch (_) {
+        throw SummaryException('Could not parse summary response.');
+      }
     }
-    _throwClaudeError(response.statusCode, response.body);
+    if (response.statusCode == 401) {
+      throw SummaryException(
+          'Invalid Claude API key. Check Settings.');
+    }
+    throw SummaryException('Claude API error (${response.statusCode}).');
   }
 
-  SummaryResult _parseOpenAiResponse(String body) {
-    try {
-      final json = jsonDecode(body) as Map<String, dynamic>;
-      final content =
-          json['choices'][0]['message']['content'] as String;
-      return _parseJson(content);
-    } catch (e) {
-      throw SummaryException('Could not parse summary response.');
-    }
-  }
+  Future<SummaryResult> _summarizeOpenAiCompat({
+    required String transcript,
+    required String apiKey,
+    required String url,
+    required String model,
+    required String providerName,
+  }) async {
+    final response = await http
+        .post(
+          Uri.parse(url),
+          headers: {
+            'Authorization': 'Bearer $apiKey',
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({
+            'model': model,
+            'messages': [
+              {'role': 'system', 'content': _systemPrompt},
+              {
+                'role': 'user',
+                'content':
+                    'Please summarize this meeting transcript:\n\n$transcript'
+              },
+            ],
+            'temperature': 0.3,
+            'max_tokens': 1000,
+          }),
+        )
+        .timeout(const Duration(minutes: 2),
+            onTimeout: () =>
+                throw SummaryException('Request timed out.'));
 
-  SummaryResult _parseClaudeResponse(String body) {
-    try {
-      final json = jsonDecode(body) as Map<String, dynamic>;
-      final content =
-          (json['content'] as List).first['text'] as String;
-      return _parseJson(content);
-    } catch (e) {
-      throw SummaryException('Could not parse summary response.');
+    if (response.statusCode == 200) {
+      try {
+        final json = jsonDecode(response.body) as Map<String, dynamic>;
+        final content =
+            json['choices'][0]['message']['content'] as String;
+        return _parseJson(content);
+      } catch (_) {
+        throw SummaryException('Could not parse summary response.');
+      }
     }
+    if (response.statusCode == 401) {
+      throw SummaryException(
+          'Invalid $providerName API key. Check Settings.');
+    }
+    if (response.statusCode == 429) {
+      throw SummaryException(
+          '$providerName rate limit reached. Wait a moment and try again.');
+    }
+    throw SummaryException(
+        '$providerName API error (${response.statusCode}).');
   }
 
   SummaryResult _parseJson(String raw) {
-    // Strip any accidental markdown code fences
     String cleaned = raw.trim();
     if (cleaned.startsWith('```')) {
       cleaned = cleaned
@@ -155,44 +190,11 @@ Guidelines:
           [],
     );
   }
-
-  Never _throwOpenAiError(int statusCode, String body) {
-    try {
-      final err = (jsonDecode(body)['error']
-          as Map<String, dynamic>?)?['message'] as String?;
-      if (statusCode == 401) {
-        throw SummaryException(
-            'Invalid OpenAI API key. Please check your key in Settings.');
-      }
-      if (statusCode == 429) {
-        throw SummaryException(
-            'OpenAI rate limit reached. Please wait and try again.');
-      }
-      throw SummaryException(
-          err ?? 'OpenAI API error ($statusCode).');
-    } catch (e) {
-      if (e is SummaryException) rethrow;
-      throw SummaryException('OpenAI API error ($statusCode).');
-    }
-  }
-
-  Never _throwClaudeError(int statusCode, String body) {
-    if (statusCode == 401) {
-      throw SummaryException(
-          'Invalid Claude API key. Please check your key in Settings.');
-    }
-    if (statusCode == 429) {
-      throw SummaryException(
-          'Claude rate limit reached. Please wait and try again.');
-    }
-    throw SummaryException('Claude API error ($statusCode).');
-  }
 }
 
 class SummaryException implements Exception {
   final String message;
   SummaryException(this.message);
-
   @override
   String toString() => message;
 }

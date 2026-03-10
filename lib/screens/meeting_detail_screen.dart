@@ -95,20 +95,21 @@ class _MeetingDetailScreenState extends State<MeetingDetailScreen> {
 
   // ─── Transcription ───────────────────────────────────────────
   Future<void> _transcribe() async {
-    final apiKey = await ApiKeysService.instance.getOpenAiKey();
+    final creds = await ApiKeysService.instance.getBestTranscriptionKey();
     if (!mounted) return;
 
-    if (apiKey == null) {
+    if (creds == null) {
       _showNoKeyDialog();
       return;
     }
 
-    setState(() { _isTranscribing = true; _aiStatus = 'Sending audio to Whisper...'; });
+    final providerLabel = creds.provider == 'groq' ? 'Groq Whisper' : 'OpenAI Whisper';
+    setState(() { _isTranscribing = true; _aiStatus = 'Sending audio to $providerLabel...'; });
 
     try {
       setState(() => _aiStatus = 'Transcribing speech to text...');
       final result = await TranscriptionService.instance
-          .transcribe(_meeting.audioFilePath!, apiKey);
+          .transcribe(_meeting.audioFilePath!, creds.key, creds.provider);
 
       if (!mounted) return;
       final updated = _meeting.copyWith(transcript: result.text);
@@ -136,11 +137,10 @@ class _MeetingDetailScreenState extends State<MeetingDetailScreen> {
   Future<void> _summarize() async {
     if (_meeting.transcript.isEmpty) return;
 
-    final openAiKey = await ApiKeysService.instance.getOpenAiKey();
-    final claudeKey = await ApiKeysService.instance.getClaudeKey();
+    final creds = await ApiKeysService.instance.getBestSummaryKey();
     if (!mounted) return;
 
-    if (openAiKey == null && claudeKey == null) {
+    if (creds == null) {
       _showNoKeyDialog();
       return;
     }
@@ -149,14 +149,18 @@ class _MeetingDetailScreenState extends State<MeetingDetailScreen> {
 
     try {
       SummaryResult result;
-      if (claudeKey != null) {
+      if (creds.provider == 'groq') {
+        setState(() => _aiStatus = 'Summarizing with Llama 3 (Groq)...');
+        result = await SummaryService.instance
+            .summarizeWithGroq(_meeting.transcript, creds.key);
+      } else if (creds.provider == 'claude') {
         setState(() => _aiStatus = 'Summarizing with Claude...');
         result = await SummaryService.instance
-            .summarizeWithClaude(_meeting.transcript, claudeKey);
+            .summarizeWithClaude(_meeting.transcript, creds.key);
       } else {
         setState(() => _aiStatus = 'Summarizing with GPT-4o...');
         result = await SummaryService.instance
-            .summarizeWithOpenAI(_meeting.transcript, openAiKey!);
+            .summarizeWithOpenAI(_meeting.transcript, creds.key);
       }
 
       if (!mounted) return;
@@ -366,7 +370,7 @@ class _MeetingDetailScreenState extends State<MeetingDetailScreen> {
                   borderRadius: BorderRadius.circular(8),
                 ),
                 child: Text(
-                  _isTranscribing ? 'Whisper' : 'GPT-4o',
+                  _isTranscribing ? 'Whisper' : 'Llama 3',
                   style: const TextStyle(
                       color: AppTheme.accent,
                       fontSize: 11,
