@@ -5,13 +5,18 @@ import 'package:http/http.dart' as http;
 class TranscriptionResult {
   final String text;
   final String? language;
-  TranscriptionResult({required this.text, this.language});
+  final String provider;
+  TranscriptionResult({required this.text, this.language, required this.provider});
 }
 
 class TranscriptionService {
-  static const _whisperUrl =
+  // Groq uses the exact same API format as OpenAI — just a different base URL
+  static const _groqUrl =
+      'https://api.groq.com/openai/v1/audio/transcriptions';
+  static const _openAiUrl =
       'https://api.openai.com/v1/audio/transcriptions';
-  static const _maxFileSizeBytes = 25 * 1024 * 1024; // 25 MB Whisper limit
+
+  static const _maxFileSizeBytes = 25 * 1024 * 1024; // 25 MB limit
 
   static TranscriptionService? _instance;
   TranscriptionService._();
@@ -20,10 +25,9 @@ class TranscriptionService {
     return _instance!;
   }
 
-  /// Transcribes an audio file using OpenAI Whisper.
-  /// Throws a [TranscriptionException] with a user-friendly message on failure.
+  /// Transcribes audio. Provider: 'groq' (free) or 'openai'.
   Future<TranscriptionResult> transcribe(
-      String audioFilePath, String apiKey) async {
+      String audioFilePath, String apiKey, String provider) async {
     final file = File(audioFilePath);
 
     if (!await file.exists()) {
@@ -33,29 +37,26 @@ class TranscriptionService {
     final fileSize = await file.length();
     if (fileSize > _maxFileSizeBytes) {
       throw TranscriptionException(
-          'Audio file is too large (max 25 MB). Current: ${(fileSize / 1048576).toStringAsFixed(1)} MB');
+          'File too large (max 25 MB). Current: ${(fileSize / 1048576).toStringAsFixed(1)} MB');
     }
     if (fileSize < 500) {
       throw TranscriptionException(
-          'Audio file is empty or too small to transcribe.');
+          'Audio file is empty. Check that your microphone was working.');
     }
 
-    final request = http.MultipartRequest(
-      'POST',
-      Uri.parse(_whisperUrl),
-    );
+    final url = provider == 'groq' ? _groqUrl : _openAiUrl;
+    // Groq uses whisper-large-v3 (more accurate), OpenAI uses whisper-1
+    final model = provider == 'groq' ? 'whisper-large-v3' : 'whisper-1';
 
+    final request = http.MultipartRequest('POST', Uri.parse(url));
     request.headers['Authorization'] = 'Bearer $apiKey';
-    request.fields['model'] = 'whisper-1';
+    request.fields['model'] = model;
     request.fields['response_format'] = 'verbose_json';
 
     final fileName = audioFilePath.split(Platform.pathSeparator).last;
     request.files.add(
-      await http.MultipartFile.fromPath(
-        'file',
-        audioFilePath,
-        filename: fileName,
-      ),
+      await http.MultipartFile.fromPath('file', audioFilePath,
+          filename: fileName),
     );
 
     http.StreamedResponse streamedResponse;
@@ -80,34 +81,38 @@ class TranscriptionService {
         final language = json['language'] as String?;
         if (text.trim().isEmpty) {
           throw TranscriptionException(
-              'No speech detected in the recording. Make sure the microphone was working during the meeting.');
+              'No speech detected. Make sure the microphone was working during recording.');
         }
-        return TranscriptionResult(text: text.trim(), language: language);
+        return TranscriptionResult(
+            text: text.trim(),
+            language: language,
+            provider: provider);
       } catch (e) {
         if (e is TranscriptionException) rethrow;
-        throw TranscriptionException('Unexpected response from Whisper API.');
+        throw TranscriptionException('Unexpected response from API.');
       }
     }
 
-    // Handle API errors
+    _throwApiError(streamedResponse.statusCode, body, provider);
+  }
+
+  Never _throwApiError(int statusCode, String body, String provider) {
     try {
-      final errJson = jsonDecode(body) as Map<String, dynamic>;
-      final errMsg =
-          (errJson['error'] as Map<String, dynamic>?)?['message'] as String?;
-      if (streamedResponse.statusCode == 401) {
+      final errMsg = (jsonDecode(body)['error']
+          as Map<String, dynamic>?)?['message'] as String?;
+      if (statusCode == 401) {
         throw TranscriptionException(
-            'Invalid OpenAI API key. Please check your key in Settings.');
+            'Invalid ${provider == 'groq' ? 'Groq' : 'OpenAI'} API key. Check Settings.');
       }
-      if (streamedResponse.statusCode == 429) {
+      if (statusCode == 429) {
         throw TranscriptionException(
-            'OpenAI rate limit reached. Please wait a moment and try again.');
+            'Rate limit reached. Please wait a moment and try again.');
       }
       throw TranscriptionException(
-          errMsg ?? 'Whisper API error (${streamedResponse.statusCode}).');
+          errMsg ?? 'API error ($statusCode). Try again.');
     } catch (e) {
       if (e is TranscriptionException) rethrow;
-      throw TranscriptionException(
-          'Whisper API error (${streamedResponse.statusCode}).');
+      throw TranscriptionException('API error ($statusCode).');
     }
   }
 }
@@ -115,7 +120,6 @@ class TranscriptionService {
 class TranscriptionException implements Exception {
   final String message;
   TranscriptionException(this.message);
-
   @override
   String toString() => message;
 }
