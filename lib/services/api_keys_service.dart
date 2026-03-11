@@ -4,6 +4,7 @@ class ApiKeysService {
   static const _openAiKey = 'api_key_openai';
   static const _claudeKey = 'api_key_claude';
   static const _groqKey = 'api_key_groq';
+  static const _elevenLabsKey = 'api_key_elevenlabs';
 
   static ApiKeysService? _instance;
   ApiKeysService._();
@@ -30,6 +31,12 @@ class ApiKeysService {
     return (key != null && key.trim().isNotEmpty) ? key.trim() : null;
   }
 
+  Future<String?> getElevenLabsKey() async {
+    final prefs = await SharedPreferences.getInstance();
+    final key = prefs.getString(_elevenLabsKey);
+    return (key != null && key.trim().isNotEmpty) ? key.trim() : null;
+  }
+
   Future<void> saveOpenAiKey(String key) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_openAiKey, key.trim());
@@ -45,13 +52,29 @@ class ApiKeysService {
     await prefs.setString(_groqKey, key.trim());
   }
 
+  Future<void> saveElevenLabsKey(String key) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_elevenLabsKey, key.trim());
+  }
+
   Future<bool> hasOpenAiKey() async => (await getOpenAiKey()) != null;
   Future<bool> hasClaudeKey() async => (await getClaudeKey()) != null;
   Future<bool> hasGroqKey() async => (await getGroqKey()) != null;
+  Future<bool> hasElevenLabsKey() async => (await getElevenLabsKey()) != null;
 
-  /// Returns the best available transcription key.
-  /// Priority: Groq (free) → OpenAI
+  /// Best transcription: ElevenLabs (Afrikaans + diarization) → Groq → OpenAI
   Future<({String key, String provider})?> getBestTranscriptionKey() async {
+    final elevenLabs = await getElevenLabsKey();
+    if (elevenLabs != null) return (key: elevenLabs, provider: 'elevenlabs');
+    final groq = await getGroqKey();
+    if (groq != null) return (key: groq, provider: 'groq');
+    final openAi = await getOpenAiKey();
+    if (openAi != null) return (key: openAi, provider: 'openai');
+    return null;
+  }
+
+  /// Fallback when ElevenLabs fails: Groq → OpenAI (no ElevenLabs)
+  Future<({String key, String provider})?> getFallbackTranscriptionKey() async {
     final groq = await getGroqKey();
     if (groq != null) return (key: groq, provider: 'groq');
     final openAi = await getOpenAiKey();

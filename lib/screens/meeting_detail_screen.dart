@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../models/meeting.dart';
 import '../services/api_keys_service.dart';
+import '../services/elevenlabs_transcription_service.dart';
+import '../services/local_transcription_service.dart';
 import '../services/storage_service.dart';
 import '../services/summary_service.dart';
 import '../services/transcription_service.dart';
@@ -94,7 +96,29 @@ class _MeetingDetailScreenState extends State<MeetingDetailScreen> {
   }
 
   // ─── Transcription ───────────────────────────────────────────
+  /// Tries on-device Whisper first (Android, no API key). Then ElevenLabs → Groq/OpenAI.
   Future<void> _transcribe() async {
+    final local = LocalTranscriptionService.instance;
+    if (local.isSupported) {
+      setState(() { _isTranscribing = true; _aiStatus = 'Transcribing on device...'; });
+      try {
+        final result = await local.transcribe(_meeting.audioFilePath!);
+        if (!mounted) return;
+        final updated = _meeting.copyWith(
+          transcript: result.text,
+          transcriptSegments: result.segments,
+        );
+        await StorageService.instance.updateMeeting(updated);
+        setState(() { _meeting = updated; _isTranscribing = false; _aiStatus = ''; });
+        if (mounted) _summarize();
+        return;
+      } on LocalTranscriptionException catch (_) {
+        if (!mounted) return;
+        setState(() { _isTranscribing = false; _aiStatus = ''; });
+        // Fall through to cloud transcription if user has keys
+      }
+    }
+
     final creds = await ApiKeysService.instance.getBestTranscriptionKey();
     if (!mounted) return;
 
@@ -103,25 +127,72 @@ class _MeetingDetailScreenState extends State<MeetingDetailScreen> {
       return;
     }
 
-    final providerLabel = creds.provider == 'groq' ? 'Groq Whisper' : 'OpenAI Whisper';
+    final providerLabel = creds.provider == 'elevenlabs'
+        ? 'ElevenLabs Scribe (Afrikaans & English)'
+        : creds.provider == 'groq'
+            ? 'Groq Whisper'
+            : 'OpenAI Whisper';
     setState(() { _isTranscribing = true; _aiStatus = 'Sending audio to $providerLabel...'; });
 
     try {
-      setState(() => _aiStatus = 'Transcribing speech to text...');
-      final result = await TranscriptionService.instance
-          .transcribe(_meeting.audioFilePath!, creds.key, creds.provider);
-
-      if (!mounted) return;
-      final updated = _meeting.copyWith(transcript: result.text);
-      await StorageService.instance.updateMeeting(updated);
-      setState(() {
-        _meeting = updated;
-        _isTranscribing = false;
-        _aiStatus = '';
-      });
-
-      // Auto-trigger summary right after transcription
+      if (creds.provider == 'elevenlabs') {
+        setState(() => _aiStatus = 'Transcribing with speaker labels...');
+        final result = await ElevenLabsTranscriptionService.instance
+            .transcribe(_meeting.audioFilePath!, creds.key);
+        if (!mounted) return;
+        final updated = _meeting.copyWith(
+          transcript: result.text,
+          transcriptSegments: result.segments,
+        );
+        await StorageService.instance.updateMeeting(updated);
+        setState(() {
+          _meeting = updated;
+          _isTranscribing = false;
+          _aiStatus = '';
+        });
+      } else {
+        setState(() => _aiStatus = 'Transcribing speech to text...');
+        final result = await TranscriptionService.instance
+            .transcribe(_meeting.audioFilePath!, creds.key, creds.provider);
+        if (!mounted) return;
+        final updated = _meeting.copyWith(transcript: result.text);
+        await StorageService.instance.updateMeeting(updated);
+        setState(() {
+          _meeting = updated;
+          _isTranscribing = false;
+          _aiStatus = '';
+        });
+      }
       if (mounted) _summarize();
+    } on ElevenLabsTranscriptionException catch (e) {
+      if (!mounted) return;
+      // Fallback to Whisper (Groq/OpenAI)
+      final fallback = await ApiKeysService.instance.getFallbackTranscriptionKey();
+      if (fallback != null && mounted) {
+        setState(() => _aiStatus = 'ElevenLabs failed. Trying ${fallback.provider == 'groq' ? 'Groq' : 'OpenAI'} Whisper...');
+        try {
+          final result = await TranscriptionService.instance
+              .transcribe(_meeting.audioFilePath!, fallback.key, fallback.provider);
+          if (!mounted) return;
+          final updated = _meeting.copyWith(transcript: result.text);
+          await StorageService.instance.updateMeeting(updated);
+          setState(() { _meeting = updated; _isTranscribing = false; _aiStatus = ''; });
+          if (mounted) _summarize();
+        } on TranscriptionException catch (e2) {
+          if (mounted) {
+            setState(() { _isTranscribing = false; _aiStatus = ''; });
+            _showError('Transcription failed', '${e.message} Fallback: ${e2.message}');
+          }
+        } catch (e2) {
+          if (mounted) {
+            setState(() { _isTranscribing = false; _aiStatus = ''; });
+            _showError('Transcription failed', e.message);
+          }
+        }
+      } else {
+        setState(() { _isTranscribing = false; _aiStatus = ''; });
+        _showError('Transcription failed', e.message);
+      }
     } on TranscriptionException catch (e) {
       if (!mounted) return;
       setState(() { _isTranscribing = false; _aiStatus = ''; });
@@ -670,33 +741,70 @@ class _MeetingDetailScreenState extends State<MeetingDetailScreen> {
           ? Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  _meeting.transcript,
-                  maxLines: _showFullTranscript ? null : 5,
-                  overflow: _showFullTranscript
-                      ? TextOverflow.visible
-                      : TextOverflow.fade,
-                  style: const TextStyle(
-                      color: Color(0xFF8892A4),
-                      fontSize: 14,
-                      height: 1.65),
-                ),
-                if (!_showFullTranscript &&
-                    _meeting.transcript.length > 250)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 10),
-                    child: GestureDetector(
-                      onTap: () =>
-                          setState(() => _showFullTranscript = true),
-                      child: const Text('Show full transcript',
-                          style: TextStyle(
-                              color: AppTheme.accent,
-                              fontSize: 13,
-                              fontWeight: FontWeight.w500)),
+                if (_meeting.hasSpeakerLabels) ...[
+                  ..._meeting.transcriptSegments.map((seg) => Padding(
+                    padding: const EdgeInsets.only(bottom: 12),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 10, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: AppTheme.accentSecondary
+                                .withValues(alpha: 0.12),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(
+                                color: AppTheme.accentSecondary
+                                    .withValues(alpha: 0.25)),
+                          ),
+                          child: Text(
+                            seg.speakerLabel,
+                            style: const TextStyle(
+                                color: AppTheme.accentSecondary,
+                                fontSize: 12,
+                                fontWeight: FontWeight.w700),
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          seg.text,
+                          style: const TextStyle(
+                              color: Color(0xFF8892A4),
+                              fontSize: 14,
+                              height: 1.6),
+                        ),
+                      ],
                     ),
+                  )),
+                ] else ...[
+                  Text(
+                    _meeting.transcript,
+                    maxLines: _showFullTranscript ? null : 5,
+                    overflow: _showFullTranscript
+                        ? TextOverflow.visible
+                        : TextOverflow.fade,
+                    style: const TextStyle(
+                        color: Color(0xFF8892A4),
+                        fontSize: 14,
+                        height: 1.65),
                   ),
+                  if (!_showFullTranscript &&
+                      _meeting.transcript.length > 250)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 10),
+                      child: GestureDetector(
+                        onTap: () =>
+                            setState(() => _showFullTranscript = true),
+                        child: const Text('Show full transcript',
+                            style: TextStyle(
+                                color: AppTheme.accent,
+                                fontSize: 13,
+                                fontWeight: FontWeight.w500)),
+                      ),
+                    ),
+                ],
                 const SizedBox(height: 12),
-                // Re-transcribe option
                 GestureDetector(
                   onTap: canTranscribe ? _transcribe : null,
                   child: Row(
@@ -705,10 +813,14 @@ class _MeetingDetailScreenState extends State<MeetingDetailScreen> {
                       const Icon(Icons.refresh_rounded,
                           color: AppTheme.textSecondary, size: 14),
                       const SizedBox(width: 5),
-                      const Text('Re-transcribe',
-                          style: TextStyle(
-                              color: AppTheme.textSecondary,
-                              fontSize: 12)),
+                      Text(
+                        _meeting.hasSpeakerLabels
+                            ? 'Re-transcribe (on-device or cloud)'
+                            : 'Re-transcribe',
+                        style: const TextStyle(
+                            color: AppTheme.textSecondary,
+                            fontSize: 12),
+                      ),
                     ],
                   ),
                 ),
@@ -1092,7 +1204,13 @@ ACTION ITEMS
 $actionsList
 
 TRANSCRIPT
-${_meeting.transcript.isEmpty ? 'No transcript.' : _meeting.transcript}
+${_meeting.transcript.isEmpty
+    ? 'No transcript.'
+    : _meeting.hasSpeakerLabels
+        ? _meeting.transcriptSegments
+            .map((s) => '${s.speakerLabel}: ${s.text}')
+            .join('\n\n')
+        : _meeting.transcript}
 ''';
     Clipboard.setData(ClipboardData(text: text));
     ScaffoldMessenger.of(context).showSnackBar(

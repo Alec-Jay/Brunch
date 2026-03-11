@@ -10,12 +10,15 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
+  final _elevenLabsController = TextEditingController();
   final _groqController = TextEditingController();
   final _openAIController = TextEditingController();
   final _claudeController = TextEditingController();
+  bool _showElevenLabs = false;
   bool _showGroq = false;
   bool _showOpenAI = false;
   bool _showClaude = false;
+  bool _elevenLabsSaved = false;
   bool _groqSaved = false;
   bool _openAISaved = false;
   bool _claudeSaved = false;
@@ -29,11 +32,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Future<void> _loadKeys() async {
+    final elevenLabs = await ApiKeysService.instance.getElevenLabsKey();
     final groq = await ApiKeysService.instance.getGroqKey();
     final openAi = await ApiKeysService.instance.getOpenAiKey();
     final claude = await ApiKeysService.instance.getClaudeKey();
     if (mounted) {
       setState(() {
+        if (elevenLabs != null) { _elevenLabsController.text = elevenLabs; _elevenLabsSaved = true; }
         if (groq != null) { _groqController.text = groq; _groqSaved = true; }
         if (openAi != null) { _openAIController.text = openAi; _openAISaved = true; }
         if (claude != null) { _claudeController.text = claude; _claudeSaved = true; }
@@ -44,17 +49,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _save() async {
     setState(() => _isSaving = true);
+    await ApiKeysService.instance.saveElevenLabsKey(_elevenLabsController.text);
     await ApiKeysService.instance.saveGroqKey(_groqController.text);
     await ApiKeysService.instance.saveOpenAiKey(_openAIController.text);
     await ApiKeysService.instance.saveClaudeKey(_claudeController.text);
     if (mounted) {
       setState(() {
         _isSaving = false;
+        _elevenLabsSaved = _elevenLabsController.text.trim().isNotEmpty;
         _groqSaved = _groqController.text.trim().isNotEmpty;
         _openAISaved = _openAIController.text.trim().isNotEmpty;
         _claudeSaved = _claudeController.text.trim().isNotEmpty;
       });
-      final anyKey = _groqSaved || _openAISaved || _claudeSaved;
+      final anyKey = _elevenLabsSaved || _groqSaved || _openAISaved || _claudeSaved;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Row(
@@ -73,6 +80,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   @override
   void dispose() {
+    _elevenLabsController.dispose();
     _groqController.dispose();
     _openAIController.dispose();
     _claudeController.dispose();
@@ -103,8 +111,26 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     _buildFreeOptionBanner(),
                     const SizedBox(height: 24),
 
-                    // ── GROQ (FREE — RECOMMENDED) ──
-                    _buildSectionLabel('GROQ — FREE  ✦  RECOMMENDED'),
+                    // ── ELEVENLABS SCRIBE — AFRIKAANS & SPEAKER LABELS ──
+                    _buildSectionLabel('ELEVENLABS SCRIBE — AFRIKAANS & ENGLISH'),
+                    const SizedBox(height: 10),
+                    _buildApiKeyCard(
+                      label: 'ElevenLabs API Key',
+                      subtitle: 'Best Afrikaans accuracy · Speaker labels (who said what) · Auto language detection',
+                      icon: Icons.record_voice_over_rounded,
+                      iconColor: const Color(0xFF0EA5E9),
+                      controller: _elevenLabsController,
+                      isVisible: _showElevenLabs,
+                      isSaved: _elevenLabsSaved,
+                      onToggle: () => setState(() => _showElevenLabs = !_showElevenLabs),
+                      placeholder: '...',
+                      learnMoreUrl: 'elevenlabs.io',
+                      isFree: false,
+                    ),
+                    const SizedBox(height: 28),
+
+                    // ── GROQ (FREE — FALLBACK) ──
+                    _buildSectionLabel('GROQ — FREE FALLBACK'),
                     const SizedBox(height: 10),
                     _buildApiKeyCard(
                       label: 'Groq API Key',
@@ -208,20 +234,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
         children: [
           const Row(
             children: [
-              Icon(Icons.bolt_rounded, color: Color(0xFFF97316), size: 18),
+              Icon(Icons.record_voice_over_rounded, color: Color(0xFF0EA5E9), size: 18),
               SizedBox(width: 8),
-              Text('Start for FREE with Groq',
+              Text('Afrikaans & English transcription',
                   style: TextStyle(color: Colors.white, fontSize: 14,
                       fontWeight: FontWeight.bold)),
-              SizedBox(width: 8),
-              _FreeBadge(),
             ],
           ),
           const SizedBox(height: 10),
-          _buildStep('1', 'Go to console.groq.com → sign up (free, no credit card)'),
-          _buildStep('2', 'Click "API Keys" → "Create API key" → copy it'),
-          _buildStep('3', 'Paste it in the Groq field below → tap Save'),
-          _buildStep('4', 'Record a meeting → open it → tap Transcribe'),
+          _buildStep('1', 'Transcription: On Android, works on-device (no key). For cloud: ElevenLabs (Afrikaans) or Groq/OpenAI → paste key in Settings'),
+          _buildStep('2', 'Or use Groq (free): console.groq.com → Create API key → paste in Groq field'),
+          _buildStep('3', 'Tap Save Settings'),
+          _buildStep('4', 'Record a meeting → open it → tap Transcribe (auto English/Afrikaans)'),
           const SizedBox(height: 6),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
@@ -436,7 +460,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
       child: Column(
         children: [
-          _buildAboutRow(Icons.bolt_rounded, 'Transcription', 'Groq Whisper-large-v3'),
+          _buildAboutRow(Icons.record_voice_over_rounded, 'Transcription', 'On-device (Android) / ElevenLabs / Groq / OpenAI'),
           const Padding(padding: EdgeInsets.symmetric(vertical: 12),
               child: Divider(height: 1)),
           _buildAboutRow(Icons.smart_toy_rounded, 'Summaries', 'Groq Llama 3 / Claude / GPT-4o'),
